@@ -1,0 +1,1 @@
+"""MangaForge AI test suite."""
