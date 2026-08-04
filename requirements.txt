@@ -1,0 +1,29 @@
+# Web API
+fastapi~=0.141.1
+uvicorn[standard]~=0.52.1
+
+# Multi-agent orchestration and local LLM integration
+langgraph~=1.2.10
+langchain~=1.3.14
+langchain-ollama~=1.1.0
+langchain-openai~=1.4.1
+
+# Configuration and JSON/schema validation
+pydantic~=2.13.4
+pydantic-settings~=2.14.2
+python-dotenv~=1.2.1
+pillow~=12.3.0
+reportlab~=5.0.0
+pypdf~=6.12.2
+pdfplumber~=0.11.10
+
+# Async database layer (SQLite now, PostgreSQL-ready)
+sqlalchemy[asyncio]~=2.0.51
+alembic~=1.18.5
+aiosqlite~=0.22.1
+psycopg[binary]~=3.3.4
+
+# HTTP client and tests
+httpx~=0.28.1
+pytest~=9.1.1
+pytest-asyncio~=1.4.0
