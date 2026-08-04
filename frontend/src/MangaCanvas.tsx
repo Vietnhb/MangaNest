@@ -9,6 +9,7 @@ import {
   ChevronRight,
   CircleHelp,
   Download,
+  Eye,
   Grid2X2,
   Image as ImageIcon,
   LayoutPanelLeft,
@@ -90,6 +91,7 @@ export function MangaCanvas({ result, episode, page, onPage, onEpisode, onExit, 
   const [rendering, setRendering] = useState(false)
   const [promptSaving, setPromptSaving] = useState(false)
   const [approvalError, setApprovalError] = useState('')
+  const [reviewing, setReviewing] = useState(false)
   const [promptDraft, setPromptDraft] = useState({ positive_prompt: '', negative_prompt: '', composition_control: '', identity_mode: 'auto' as 'auto' | 'reference' | 'off', identity_strength: null as number | null })
   const drag = useRef<{ id: string; panelId: string; startX: number; startY: number; x: number; y: number; width: number; height: number } | null>(null)
   const history = useRef<EpisodeEdit[]>([])
@@ -211,12 +213,23 @@ export function MangaCanvas({ result, episode, page, onPage, onEpisode, onExit, 
       onEpisode(payload); onArtwork()
     } catch (error) { setApprovalError(error instanceof Error ? error.message : 'Chưa thể duyệt xuất bản') }
   }
+  const reviewEpisode = async () => {
+    if (!result.episode_id) return
+    setReviewing(true); setApprovalError('')
+    try {
+      const response = await fetch(`${API_BASE}/story-episodes/${result.episode_id}/review`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ expected_revision: episode.revision }) })
+      const payload = await response.json()
+      if (!response.ok) throw new Error(payload.detail || 'Không thể kiểm duyệt ảnh')
+      onEpisode(payload)
+    } catch (error) { setApprovalError(error instanceof Error ? error.message : 'Không thể kiểm duyệt ảnh') }
+    finally { setReviewing(false) }
+  }
 
   return <div className="manga-editor-shell">
     <header className="manga-editor-topbar">
       <div className="editor-project"><button onClick={onExit} aria-label="Quay lại"><ArrowLeft /></button><span className="editor-logo">漫</span><div><strong>{result.story.title}</strong><small>Tập {result.episode_number || 1} · {saveState === 'idle' ? 'Có thay đổi chưa lưu' : saveState === 'saving' ? 'Đang lưu…' : saveState === 'saved' ? 'Đã lưu' : 'Lưu thất bại'}</small></div><ChevronDown /></div>
       <div className="history-actions"><button aria-label="Hoàn tác" onClick={undo} disabled={!history.current.length}><Undo2 /></button><button aria-label="Làm lại" onClick={redo} disabled={!future.current.length}><Redo2 /></button><span /></div>
-      <div className="editor-publish"><span className="editor-hint"><CircleHelp /> {quality ? `Quality ${quality.overall_score.toFixed(1)}/10` : 'Cần review mới sau khi dựng'}</span><button className="save-canvas" onClick={() => void save()} disabled={saveState === 'saving'}><Save /> Lưu</button><button className="publish-button" onClick={() => episode.status === 'approved' ? onArtwork() : void approveEpisode()}><Sparkles /> {episode.status === 'approved' ? 'Mở bản xuất' : 'Duyệt & xuất bản'}</button></div>
+      <div className="editor-publish"><span className="editor-hint"><CircleHelp /> {quality ? `Quality ${quality.overall_score.toFixed(1)}/10` : 'Cần review mới sau khi dựng'}</span><button className="save-canvas" onClick={() => void reviewEpisode()} disabled={reviewing}><Eye /> {reviewing ? 'Đang review…' : 'Review lại'}</button><button className="save-canvas" onClick={() => void save()} disabled={saveState === 'saving'}><Save /> Lưu</button><button className="publish-button" onClick={() => episode.status === 'approved' ? onArtwork() : void approveEpisode()}><Sparkles /> {episode.status === 'approved' ? 'Mở bản xuất' : 'Duyệt & xuất bản'}</button></div>
     </header>
 
     <div className="manga-editor-body">

@@ -1,8 +1,14 @@
 import asyncio
+import hashlib
+import io
 import logging
+import re
+from pathlib import Path
 from typing import Annotated, Any
+from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile, status
+from PIL import Image, UnidentifiedImageError
 
 from app.core.config import Settings, get_settings
 from app.db.repository import RunRepository, get_run_repository
@@ -22,6 +28,7 @@ from app.services.demo import DEMO_PANELS, demo_panel_svg, demo_project
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["manga"])
+CHARACTER_REFERENCE_VIEWS = {"front", "three_quarter", "profile", "back", "full_body", "expression"}
 
 
 @router.get("/demo-project")
@@ -195,6 +202,66 @@ async def get_story_episode(episode_id: str, repository: Annotated[RunRepository
     return result
 
 
+@router.post(
+    "/story-episodes/{episode_id}/character-references/{character_name}",
+    response_model=EpisodeDetail,
+)
+async def upload_character_reference(
+    episode_id: str,
+    character_name: str,
+    expected_revision: Annotated[int, Form(ge=1)],
+    view: Annotated[str, Form()],
+    image: Annotated[UploadFile, File()],
+    settings: Annotated[Settings, Depends(get_settings)],
+    repository: Annotated[RunRepository, Depends(get_run_repository)],
+) -> EpisodeDetail:
+    """Import one approved camera view into the episode's visual character bible."""
+    normalized_view = view.strip().casefold()
+    if normalized_view not in CHARACTER_REFERENCE_VIEWS:
+        raise HTTPException(status_code=422, detail=f"Unsupported reference view: {view}")
+    episode = await repository.get_episode(episode_id)
+    if episode is None:
+        raise HTTPException(status_code=404, detail="Episode not found")
+    generation = GenerationOutput.model_validate(episode.generation)
+    identity = next((
+        item
+        for panel in generation.panels
+        for item in panel.character_consistency
+        if character_name.casefold() in item.casefold()
+    ), None)
+    if identity is None:
+        raise HTTPException(status_code=422, detail="Character is not present in this episode")
+    payload = await image.read()
+    if not payload or len(payload) > 15 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Reference image must be between 1 byte and 15 MB")
+    try:
+        with Image.open(io.BytesIO(payload)) as source:
+            source.verify()
+        with Image.open(io.BytesIO(payload)) as source:
+            prepared = source.convert("RGB")
+            prepared.thumbnail((2048, 2048), Image.Resampling.LANCZOS)
+            safe_character = re.sub(r"[^a-zA-Z0-9_-]+", "-", character_name).strip("-") or "character"
+            directory = Path(settings.render_output_dir) / "character_bibles" / episode.series_id / safe_character
+            directory.mkdir(parents=True, exist_ok=True)
+            destination = directory / f"{normalized_view}_{uuid4().hex[:10]}.png"
+            prepared.save(destination, format="PNG", optimize=True)
+    except (UnidentifiedImageError, OSError) as exc:
+        raise HTTPException(status_code=422, detail="The uploaded file is not a valid image") from exc
+    base_key = hashlib.sha256(identity.strip().casefold().encode("utf-8")).hexdigest()[:16]
+    reference_key = f"{base_key}:{normalized_view}"
+    try:
+        result = await repository.update_episode_identity_reference(
+            episode_id, expected_revision, reference_key, str(destination.resolve())
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=423, detail="Episode is locked") from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail="Episode was changed elsewhere; reload before uploading") from exc
+    if result is None:
+        raise HTTPException(status_code=404, detail="Episode not found")
+    return result
+
+
 @router.put("/story-episodes/{episode_id}/editor", response_model=EpisodeDetail)
 async def update_story_episode_editor(episode_id: str, payload: EpisodeEditorUpdate, repository: Annotated[RunRepository, Depends(get_run_repository)]) -> EpisodeDetail:
     try:
@@ -246,7 +313,14 @@ async def rerender_story_episode(
         current_render = RenderOutput.model_validate(episode.render)
         reusable_references = (
             current_render.identity_references
-            if current_render.workflow_version in {"sdxl-ipadapter-identity-v4", "sdxl-ipadapter-identity-v5"}
+            if current_render.workflow_version in {
+                "sdxl-ipadapter-identity-v4",
+                "sdxl-ipadapter-identity-v5",
+                "sdxl-faceid-plus-v2-v6",
+                "sdxl-ipadapter-plus-face-v6",
+                "sdxl-faceid-plus-v2-v7",
+                "sdxl-ipadapter-plus-face-v7",
+            }
             else {}
         )
         rendered = await create_renderer(settings).render(

@@ -93,7 +93,7 @@ async def system_status() -> dict:
     models_dir = Path(settings.comfyui_models_dir)
     checkpoint_path = models_dir / "checkpoints" / settings.comfyui_checkpoint
     clip_vision_path = models_dir / "clip_vision" / "CLIP-ViT-H-14-laion2B-s32B-b79K.safetensors"
-    ipadapter_path = models_dir / "ipadapter" / "ip-adapter-plus_sdxl_vit-h.safetensors"
+    ipadapter_path = models_dir / "ipadapter" / "ip-adapter-plus-face_sdxl_vit-h.safetensors"
     return {
         "status": "ok" if llm["online"] and vision["online"] and comfyui["online"] else "degraded",
         "llm": llm,
@@ -107,7 +107,7 @@ async def system_status() -> dict:
         "identity_conditioning": {
             "enabled": settings.comfyui_ipadapter_enabled,
             "ready": clip_vision_path.exists() and ipadapter_path.exists(),
-            "engine": "IP-Adapter Plus SDXL",
+            "engine": "IP-Adapter Plus Face SDXL + multi-view character bible",
         },
         "output_directory": settings.render_output_dir,
     }

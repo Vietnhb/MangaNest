@@ -30,7 +30,24 @@ MangaForge adopts the following domain logic from that benchmark and from comic-
 6. `Lettering last`: dialogue, captions, SFX, vertical text, tails, fonts, and spacing remain deterministic vector-like layers.
 7. `Release gate`: fresh visual review plus human approval is required before 300/600 DPI, PDF, or CBZ export.
 
-Reference conditioning is adaptive, not globally forced. A general IP-Adapter reference can transfer reference composition and destroy wide or multi-character scenes. In `auto` mode MangaForge therefore disables a single-person reference for reflections/multiple subjects, uses low strength for wide shots, and allows a per-panel `reference` or `off` override. FaceID/LoRA and ControlNet pose/depth/line controls are the next render-recipe capabilities; they must not be simulated by merely adding more prompt text.
+### Adopted core business flow
+
+The supplied four-stage base is used as an implementation contract:
+
+1. `Script decomposition`: typed story, scene, camera, action, emotion, dialogue, narration, and SFX data.
+2. `Character and prompt compilation`: approved multi-view character anchors plus a bounded, tag-ordered Animagine prompt compiler. Dialogue never enters the diffusion prompt.
+3. `Panel rendering`: headless ComfyUI jobs produce artwork-only panel versions. A single 4 GB worker renders sequentially; parallel fan-out belongs at the queue/GPU-pool level, not as concurrent requests competing on one GPU.
+4. `Deterministic finishing`: Pillow composes the stored layout, performs pixel-measured Unicode wrapping, renders bubbles/tails/captions/SFX, and builds publication artifacts only after approval.
+
+Instructor, Fal.ai, and Replicate are not dependencies because the existing Pydantic, LangGraph, and provider adapters already own those responsibilities. Celery is not introduced into the alpha merely as a second job abstraction; Redis-backed durable workers remain a Stage 2 replacement for the in-process job store. This preserves the useful business boundaries without duplicating infrastructure.
+
+Reference conditioning is adaptive, not globally forced. A general IP-Adapter reference can transfer reference composition and destroy wide or multi-character scenes. In `auto` mode MangaForge therefore disables a full-image portrait reference for wide shots, reflections, and multiple subjects, and allows a per-panel `reference` or `off` override. FaceID is opt-in because InsightFace does not reliably detect stylized manga portraits and its pretrained face models are not licensed as a commercial production default. Spatial masks, ControlNet pose/depth/line controls, and character-layer compositing must not be simulated by merely adding more prompt text.
+
+### Character-first production gate
+
+Panel generation begins only after each recurring character has an approved visual bible. The minimum reference set is `front`, `three_quarter`, `profile`, `back`, `full_body`, and `expression`. A creator can import art or approve generated candidates. Each asset is versioned independently, records outfit and style scope, and must be replaceable without rewriting story text.
+
+For every panel the render recipe selects the nearest approved camera view instead of reusing one portrait everywhere. Multiple reference embeddings may be averaged on low-VRAM workers, but spatial attention masks are required when a character occupies only part of the panel. Wide and multi-character panels use separate character layers or masked inpainting before compositing. Only the resulting composite proceeds to lettering and visual review.
 
 ## Architecture principles
 
@@ -161,7 +178,10 @@ The repository has completed part of Stage 1. It still uses SQLite, an in-proces
 - MangaMaker public workflow and feature surface: https://mangamaker.app/
 - ComicCamp human-in-the-loop story/script/illustration/lettering framework: https://creativity-ai.github.io/assets/papers/70.pdf
 - IP-Adapter Plus node behavior and reference-conditioning controls: https://github.com/cubiq/ComfyUI_IPAdapter_plus
+- InstantID capabilities, single-face limitation, and InsightFace licensing warning: https://github.com/instantX-research/InstantID
 - ControlNet pose, depth, edge, and line conditioning: https://github.com/lllyasviel/ControlNet
+- Animagine XL 4.0 tag ordering, quality tags, settings, and resolution guidance: https://huggingface.co/cagliostrolab/animagine-xl-4.0
+- Supported PyTorch CUDA installation matrix: https://pytorch.org/get-started/previous-versions/
 - Layout-controllable manga diffusion: https://arxiv.org/abs/2412.19303
 - Retrieval-augmented comic identity and costume consistency: https://arxiv.org/abs/2506.12517
 

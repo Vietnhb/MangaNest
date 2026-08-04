@@ -121,10 +121,23 @@ class VisionCritiqueAgent:
             )
             raw = response.message.content or response.message.thinking or ""
             decoded = json.loads(raw.strip().removeprefix("```json").removesuffix("```").strip())
+            issues = [
+                issue for issue in decoded.get("issues", [])
+                if not any(term in issue.casefold() for term in (
+                    "speech bubble", "dialogue bubble", "missing text", "no text",
+                    "mouth open", "open speaking mouth",
+                ))
+            ]
+            correction = decoded.get("correction")
+            if correction and any(term in correction.casefold() for term in ("speech bubble", "dialogue bubble")):
+                correction = "; ".join(
+                    part.strip() for part in correction.split(";")
+                    if "bubble" not in part.casefold()
+                ) or None
             critiques.append(PanelCritique(
                 panel_id=requirement["panel_id"],
                 score=decoded["score"], strengths=decoded.get("strengths", []),
-                issues=decoded.get("issues", []), correction=decoded.get("correction"),
+                issues=issues, correction=correction,
             ))
         overall = round(sum(item.score for item in critiques) / len(critiques), 2)
         return CritiqueOutput(

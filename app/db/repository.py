@@ -394,6 +394,34 @@ class SqlAlchemyRunRepository:
             await session.commit(); await session.refresh(row)
             return _episode_detail(row, critique_payload)
 
+    async def update_episode_identity_reference(
+        self, episode_id: str, expected_revision: int, reference_key: str, image_path: str
+    ) -> EpisodeDetail | None:
+        """Persist an approved character-bible view without pretending it is panel art."""
+        await self._ensure_schema()
+        async with self.session_factory() as session:
+            row = await session.get(StoryEpisode, episode_id)
+            if row is None:
+                return None
+            if row.status == "locked":
+                raise PermissionError("episode_locked")
+            if row.revision != expected_revision:
+                raise RuntimeError("revision_conflict")
+            render = RenderOutput.model_validate(row.render_payload)
+            references = {**render.identity_references, reference_key: image_path}
+            updated = render.model_copy(update={"identity_references": references})
+            row.render_payload = updated.model_dump(mode="json")
+            row.status = "draft"
+            row.revision += 1
+            row.updated_at = datetime.now(timezone.utc)
+            if row.run_id:
+                run = await session.get(MangaRun, row.run_id)
+                if run is not None:
+                    run.render_payload = row.render_payload
+            await session.commit()
+            await session.refresh(row)
+            return _episode_detail(row)
+
     async def update_episode_panel_prompt(
         self, episode_id: str, panel_id: str, payload: PanelPromptUpdate
     ) -> EpisodeDetail | None:

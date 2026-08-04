@@ -22,6 +22,7 @@ import {
   RefreshCw,
   Settings2,
   Sparkles,
+  Upload,
   Users,
   WandSparkles,
   X,
@@ -69,6 +70,7 @@ export interface MangaResult {
   render: {
     backend: RenderMode; checkpoint: string
     panels: { panel_id: string; status: string; image_url?: string; seed?: number }[]
+    identity_references?: Record<string, string>
     pages?: { page_number: number; image_url: string; width: number; height: number }[]
     publication?: { pdf_url: string; cbz_url: string; manifest_url: string }
   }
@@ -498,7 +500,7 @@ function StudioWorkspace({ result, phase, isDemo, mobileNav, selectedPage, selec
     <main className="workspace">
       <div className="workspace-head"><div><p className="eyebrow">{studioPhases.find((item) => item.id === phase)?.hint}</p><h1>{studioPhases.find((item) => item.id === phase)?.label}</h1></div><div className="workspace-score"><span>Điểm kiểm duyệt</span><strong>{result.critique.overall_score.toFixed(1)}</strong><small>/10</small></div></div>
       {phase === 'story' && <StoryDesk result={result} />}
-      {phase === 'characters' && <CharacterDesk result={result} />}
+      {phase === 'characters' && <CharacterDeskV2 result={result} episode={episode} onEpisode={setEpisode} />}
       {phase === 'artwork' && <ArtworkDesk result={result} episode={episode} onEpisode={setEpisode} selected={selectedPanel} onSelect={onPanel} />}
       {phase === 'review' && <ReviewDesk result={result} />}
       {phase === 'export' && <ExportDesk result={result} episode={episode} />}
@@ -510,8 +512,55 @@ function StoryDesk({ result }: { result: MangaResult }) {
   return <div className="desk story-desk"><section className="story-hero"><div className="tag-row">{result.story.genre.map((genre) => <span key={genre}>{genre}</span>)}</div><h2>{result.story.logline}</h2><p>{result.story.visual_tone}</p></section><div className="desk-title"><div><p className="eyebrow">STORY BEATS</p><h3>Nhịp truyện</h3></div><span>{result.story.outline.length} nhịp</span></div><div className="beat-list">{result.story.outline.map((beat) => <article key={beat.beat_number}><span>{String(beat.beat_number).padStart(2, '0')}</span><div><h4>{beat.name}</h4><p>{beat.summary}</p><small>{beat.emotional_goal}</small></div></article>)}</div></div>
 }
 
-function CharacterDesk({ result }: { result: MangaResult }) {
-  return <div className="desk"><div className="desk-title"><div><p className="eyebrow">CHARACTER BIBLE</p><h3>Hồ sơ nhân vật</h3></div><span>{result.story.characters.length} nhân vật</span></div><p className="desk-intro">Thông tin này được khóa xuyên suốt mọi panel để hạn chế nhân vật thay đổi khuôn mặt, tóc và trang phục.</p><div className="character-grid">{result.story.characters.map((character, index) => <article key={character.name}><div className="character-avatar"><Users size={28} /><span>0{index + 1}</span></div><div><small>{character.role}</small><h3>{character.name}</h3><p>{character.appearance}</p><dl><dt>Tính cách</dt><dd>{character.personality}</dd><dt>Động lực</dt><dd>{character.motivation}</dd></dl></div></article>)}</div></div>
+const referenceViews = [
+  ['front', 'Chính diện'], ['three_quarter', 'Góc 3/4'], ['profile', 'Nghiêng'],
+  ['back', 'Sau lưng'], ['full_body', 'Toàn thân'], ['expression', 'Biểu cảm'],
+] as const
+
+function outputImageUrl(path: string) {
+  const normalized = path.replaceAll('\\', '/')
+  const marker = '/outputs/'
+  const index = normalized.toLowerCase().lastIndexOf(marker)
+  return index >= 0 ? `${API_BASE}${normalized.slice(index)}` : ''
+}
+
+async function identityHash(value: string) {
+  const bytes = new TextEncoder().encode(value.trim().toLocaleLowerCase())
+  const digest = await crypto.subtle.digest('SHA-256', bytes)
+  return Array.from(new Uint8Array(digest)).map((byte) => byte.toString(16).padStart(2, '0')).join('').slice(0, 16)
+}
+
+function CharacterDeskV2({ result, episode, onEpisode }: { result: MangaResult; episode: EpisodeEdit; onEpisode: (episode: EpisodeEdit) => void }) {
+  const [keys, setKeys] = useState<Record<string, string>>({})
+  const [uploading, setUploading] = useState<string | null>(null)
+  const [message, setMessage] = useState<string | null>(null)
+  const references = episode.render?.identity_references || result.render.identity_references || {}
+
+  useEffect(() => {
+    void Promise.all(result.story.characters.map(async (character) => {
+      const anchor = result.generation.panels.flatMap((panel) => panel.character_consistency)
+        .find((item) => item.toLocaleLowerCase().includes(character.name.toLocaleLowerCase()))
+      return [character.name, anchor ? await identityHash(anchor) : ''] as const
+    })).then((entries) => setKeys(Object.fromEntries(entries)))
+  }, [result])
+
+  const upload = async (character: Character, view: string, file?: File) => {
+    if (!file || !result.episode_id) return
+    const token = `${character.name}:${view}`
+    setUploading(token); setMessage(null)
+    const body = new FormData()
+    body.set('expected_revision', String(episode.revision)); body.set('view', view); body.set('image', file)
+    try {
+      const response = await fetch(`${API_BASE}/story-episodes/${result.episode_id}/character-references/${encodeURIComponent(character.name)}`, { method: 'POST', body })
+      if (!response.ok) throw new Error((await response.json()).detail || 'Không thể nhập ảnh tham chiếu')
+      onEpisode(await response.json())
+      setMessage(`Đã khóa góc ${view} cho ${character.name}.`)
+    } catch (reason) {
+      setMessage(reason instanceof Error ? reason.message : 'Không thể nhập ảnh tham chiếu')
+    } finally { setUploading(null) }
+  }
+
+  return <div className="desk character-bible-desk"><div className="desk-title"><div><p className="eyebrow">VISUAL CHARACTER BIBLE</p><h3>Hồ sơ đa góc nhân vật</h3></div><span>{result.story.characters.length} nhân vật</span></div><p className="desk-intro">Duyệt hoặc nhập bộ ảnh chính diện, 3/4, nghiêng, sau lưng, toàn thân và biểu cảm trước khi render panel. Hệ thống tự chọn góc gần nhất theo camera; ảnh tham chiếu không còn bị áp tùy tiện lên cảnh rộng.</p>{message && <div className="reference-message">{message}</div>}<div className="character-bible-list">{result.story.characters.map((character, index) => <article className="character-bible-card" key={character.name}><header><div className="character-avatar"><Users size={28} /><span>0{index + 1}</span></div><div><small>{character.role}</small><h3>{character.name}</h3><p>{character.appearance}</p></div></header><div className="reference-view-grid">{referenceViews.map(([view, label]) => { const path = references[`${keys[character.name]}:${view}`]; const url = path ? outputImageUrl(path) : ''; const token = `${character.name}:${view}`; return <label className={url ? 'has-reference' : ''} key={view}>{url ? <img src={url} alt={`${character.name} ${label}`} /> : <span><Upload size={18} />{uploading === token ? 'Đang tải…' : label}</span>}<input type="file" accept="image/png,image/jpeg,image/webp" disabled={uploading !== null || !result.episode_id} onChange={(event) => void upload(character, view, event.target.files?.[0])} /><i>{label}</i></label> })}</div></article>)}</div></div>
 }
 
 function layoutNeedsRepair(panels: LayoutPanel[]) {

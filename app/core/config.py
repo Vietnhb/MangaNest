@@ -58,6 +58,12 @@ class Settings(BaseSettings):
     comfyui_ipadapter_enabled: bool = True
     comfyui_ipadapter_weight: float = Field(default=0.42, ge=0, le=1.5)
     comfyui_ipadapter_end_at: float = Field(default=0.65, ge=0.1, le=1)
+    # InsightFace does not reliably detect stylized manga faces. Keep FaceID as an
+    # opt-in path for photographic references; PLUS FACE is the production default.
+    comfyui_faceid_enabled: bool = False
+    comfyui_faceid_lora_strength: float = Field(default=0.65, ge=0, le=2)
+    comfyui_faceid_weight_v2: float = Field(default=1.0, ge=0, le=2)
+    comfyui_faceid_provider: Literal["CPU", "CUDA", "ROCM", "DirectML", "OpenVINO", "CoreML"] = "CPU"
     render_output_dir: str = "E:/MangaForgeAI/outputs"
     render_max_width: int = Field(default=1216, ge=256, le=4096)
     render_max_height: int = Field(default=1216, ge=256, le=4096)

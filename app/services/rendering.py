@@ -33,6 +33,7 @@ def _monochrome_description(value: str) -> str:
 
 
 def _prompt_tags(*sections: str, limit: int) -> list[str]:
+    """Compile bounded, stable diffusion tags while preserving semantic order."""
     tags: list[str] = []
     seen: set[str] = set()
     for section in sections:
@@ -53,22 +54,31 @@ def _compile_animagine_positive(panel: PanelGenerationPrompt, generation: Genera
     subjects = [tag for tag in raw_tags if _SUBJECT_TAG.fullmatch(tag)]
     details = [tag for tag in raw_tags if tag not in subjects]
     identity = ", ".join(_monochrome_description(item) for item in panel.character_consistency)
-    return ", ".join(_prompt_tags(
-        ", ".join(subjects), identity, ", ".join(details), panel.composition_control,
-        _monochrome_description(generation.global_style_prefix),
-        "single uninterrupted illustration, one scene, no frames, no borders, monochrome, grayscale, "
-        "black and white, crisp inked lineart, screentone, high contrast",
-        "safe, masterpiece, high score, great score, absurdres", limit=64,
-    ))
+    style = (
+        "single uninterrupted illustration, one scene, no frames, no borders, "
+        "monochrome, grayscale, black and white, crisp inked lineart, screentone, high contrast"
+    )
+    tags = _prompt_tags(
+        ", ".join(subjects), identity, ", ".join(details),
+        panel.composition_control, _monochrome_description(generation.global_style_prefix),
+        style, "safe, masterpiece, high score, great score, absurdres",
+        limit=64,
+    )
+    return ", ".join(tags)
 
 
 def _compile_animagine_negative(panel: PanelGenerationPrompt, generation: GenerationOutput) -> str:
+    official = (
+        "lowres, bad anatomy, bad hands, text, error, missing finger, extra digits, fewer digits, "
+        "cropped, worst quality, low quality, low score, bad score, average score, signature, "
+        "watermark, username, blurry"
+    )
+    page_artifacts = (
+        "color, colorful, multiple panels, manga page, comic page, comic strip, panel grid, collage, "
+        "split screen, contact sheet, frame, panel border, speech bubble, lettering"
+    )
     return ", ".join(_prompt_tags(
-        "lowres, bad anatomy, bad hands, text, error, missing finger, extra digits, fewer digits, cropped, "
-        "worst quality, low quality, low score, bad score, average score, signature, watermark, username, blurry",
-        "color, colorful, multiple panels, manga page, comic page, comic strip, panel grid, collage, split screen, "
-        "contact sheet, frame, panel border, speech bubble, lettering",
-        generation.global_negative_prefix, panel.negative_prompt, limit=64,
+        official, page_artifacts, generation.global_negative_prefix, panel.negative_prompt, limit=64,
     ))
 
 
@@ -92,14 +102,15 @@ def _bounded_dimensions(
 
 
 def _normalize_manga_art(path: Path) -> None:
+    """Remove residual chroma while preserving the model's midtone detail."""
     with Image.open(path) as source:
-        normalized = ImageOps.grayscale(source).filter(
-            ImageFilter.UnsharpMask(radius=0.45, percent=25, threshold=4)
-        )
+        gray = ImageOps.grayscale(source)
+        normalized = gray.filter(ImageFilter.UnsharpMask(radius=0.45, percent=25, threshold=4))
         normalized.save(path, format="PNG", optimize=True)
 
 
 def _technical_candidate_score(path: Path) -> float:
+    """Reject blank, clipped or near-flat candidates if semantic review is unavailable."""
     with Image.open(path) as source:
         image = ImageOps.grayscale(source).resize((256, 256), Image.Resampling.BILINEAR)
         histogram = image.histogram()
@@ -107,17 +118,8 @@ def _technical_candidate_score(path: Path) -> float:
         clipped = (sum(histogram[:4]) + sum(histogram[-4:])) / pixels
         entropy = image.entropy()
         edges = image.filter(ImageFilter.FIND_EDGES)
-        edge_energy = sum(i * count for i, count in enumerate(edges.histogram())) / (pixels * 255)
+        edge_energy = sum(index * count for index, count in enumerate(edges.histogram())) / (pixels * 255)
     return entropy + edge_energy * 2.0 - clipped * 3.0
-
-
-def _candidate_is_flat(path: Path) -> bool:
-    with Image.open(path) as source:
-        gray = ImageOps.grayscale(source).resize((256, 256), Image.Resampling.BILINEAR)
-        extrema = gray.getextrema()
-        return gray.entropy() < 3.0 or (extrema[1] - extrema[0]) < 24
-
-
 class RenderingService:
     """Dispatch panel prompts to prompt-only, mock, or local ComfyUI rendering."""
 
@@ -240,19 +242,23 @@ class RenderingService:
                 identity_profile = self._identity_conditioning_profile(panel)
                 reference_key = self._identity_reference_key(panel)
                 if self.settings.comfyui_ipadapter_enabled and reference_key and identity_profile:
-                    if reference_key not in references:
+                    view = self._identity_reference_view(panel)
+                    view_key = f"{reference_key}:{view}"
+                    selected_key = view_key if view_key in references else reference_key
+                    if selected_key not in references:
                         reference = await self._render_identity_reference(
                             client, panel, generation, revision_count, reference_key
                         )
                         if reference.image_path:
                             references[reference_key] = reference.image_path
-                    reference_path = references.get(reference_key)
+                            selected_key = reference_key
+                    reference_path = references.get(selected_key)
                     if reference_path:
-                        if reference_key not in uploaded_references:
-                            uploaded_references[reference_key] = await self._upload_reference(
-                                client, Path(reference_path), reference_key
+                        if selected_key not in uploaded_references:
+                            uploaded_references[selected_key] = await self._upload_reference(
+                                client, Path(reference_path), hashlib.sha256(selected_key.encode()).hexdigest()[:16]
                             )
-                        reference_image = uploaded_references[reference_key]
+                        reference_image = uploaded_references[selected_key]
                 rendered.append(
                     await self._render_comfyui_panel(
                         client, panel, generation, revision_count, reference_image,
@@ -263,7 +269,13 @@ class RenderingService:
         return RenderOutput(
             backend="comfyui",
             checkpoint=self.settings.comfyui_checkpoint,
-            workflow_version="sdxl-ipadapter-native-candidates-v7" if self.settings.comfyui_ipadapter_enabled else "sdxl-native-candidates-v3",
+            workflow_version=(
+                "sdxl-faceid-plus-v2-v7"
+                if self.settings.comfyui_ipadapter_enabled and self.settings.comfyui_faceid_enabled
+                else "sdxl-ipadapter-plus-face-v7"
+                if self.settings.comfyui_ipadapter_enabled
+                else "sdxl-native-candidates-v3"
+            ),
             panels=rendered,
             identity_references=references,
         )
@@ -274,6 +286,19 @@ class RenderingService:
             return None
         identity = panel.character_consistency[0].strip().casefold()
         return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
+
+    @staticmethod
+    def _identity_reference_view(panel: PanelGenerationPrompt) -> str:
+        scene = f"{panel.positive_prompt} {panel.composition_control}".casefold()
+        if any(token in scene for token in ("profile", "side view", "from the side")):
+            return "profile"
+        if any(token in scene for token in ("back view", "from behind")):
+            return "back"
+        if any(token in scene for token in ("full body", "full-body", "head to toe")):
+            return "full_body"
+        if any(token in scene for token in ("close-up", "close up", "front view")):
+            return "front"
+        return "three_quarter"
 
     def _identity_conditioning_profile(
         self, panel: PanelGenerationPrompt
@@ -288,13 +313,19 @@ class RenderingService:
         ))
         if panel.identity_mode == "auto" and multi_subject:
             return None
+        wide_shot = "wide" in scene or "establishing" in scene
+        if panel.identity_mode == "auto" and wide_shot:
+            # A global portrait embedding leaks the reference composition into
+            # environmental shots. Wide identity needs a spatial face mask or a
+            # separately composited character layer, not full-image conditioning.
+            return None
         if panel.identity_strength is not None:
             return panel.identity_strength, self.settings.comfyui_ipadapter_end_at
-        if "wide" in scene or "establishing" in scene:
-            return min(self.settings.comfyui_ipadapter_weight, 0.20), 0.50
+        if wide_shot:
+            return min(self.settings.comfyui_ipadapter_weight, 0.25), 0.55
         if "close-up" in scene or "close up" in scene or "portrait" in scene:
-            return min(self.settings.comfyui_ipadapter_weight, 0.38), 0.65
-        return min(self.settings.comfyui_ipadapter_weight, 0.28), 0.58
+            return min(max(self.settings.comfyui_ipadapter_weight, 0.50), 0.65), 0.75
+        return min(self.settings.comfyui_ipadapter_weight, 0.38), 0.65
 
     async def _render_identity_reference(
         self,
@@ -309,12 +340,13 @@ class RenderingService:
             "panel_id": f"identity_{reference_key}",
             "positive_prompt": (
                 f"solo character, {anchor}, centered upper-body character reference portrait, "
-                "front three-quarter view, neutral expression, face fully visible, hairstyle and outfit fully visible, "
-                "plain light gray studio background, clean professional manga character sheet, precise facial features"
+                "front view, neutral expression, face fully visible and occupying 70 percent of the image, "
+                "head and shoulders, hairstyle fully visible, plain white studio background, "
+                "clean professional manga identity portrait, precise facial features, no frame, no card"
             ),
             "negative_prompt": (
                 "multiple people, duplicate person, profile only, face hidden, cropped head, cropped hair, "
-                "action pose, complex background, text, labels, character turnaround grid"
+                "action pose, complex background, text, labels, character turnaround grid, frame, card, border"
             ),
             "character_consistency": [],
             "composition_control": "centered upper-body identity reference",
@@ -331,12 +363,23 @@ class RenderingService:
     async def _upload_reference(
         client: httpx.AsyncClient, path: Path, reference_key: str
     ) -> str:
-        with path.open("rb") as source:
-            response = await client.post(
-                "/upload/image",
-                files={"image": (f"mangaforge_ref_{reference_key}.png", source, "image/png")},
-                data={"type": "input", "overwrite": "true"},
-            )
+        # References are generated as centered head-and-shoulders portraits. Feed
+        # only the face/hair region to CLIP Vision so the adapter cannot copy the
+        # portrait card/background composition into a wide manga panel.
+        with Image.open(path) as source:
+            image = source.convert("RGB")
+            width, height = image.size
+            crop = image.crop((
+                int(width * 0.20), int(height * 0.06),
+                int(width * 0.80), int(height * 0.66),
+            )).resize((512, 512), Image.Resampling.LANCZOS)
+            buffer = io.BytesIO()
+            crop.save(buffer, format="PNG", optimize=True)
+        response = await client.post(
+            "/upload/image",
+            files={"image": (f"mangaforge_ref_{reference_key}.png", buffer.getvalue(), "image/png")},
+            data={"type": "input", "overwrite": "true"},
+        )
         response.raise_for_status()
         payload = response.json()
         subfolder = payload.get("subfolder", "")
@@ -394,17 +437,8 @@ class RenderingService:
                         candidate_path = self.output_dir / relative_path
                         await asyncio.to_thread(_normalize_manga_art, candidate_path)
                         candidates.append((relative_path, candidate_path))
-                    usable = [item for item in candidates if not _candidate_is_flat(item[1])]
-                    if not usable:
-                        if quality_retry < 1:
-                            logger.warning("All candidates for %s were flat; retrying with new noise", panel.panel_id)
-                            return await self._render_comfyui_panel(
-                                client, panel, generation, revision_count, reference_image,
-                                reference_strength, reference_end_at, quality_retry + 1,
-                            )
-                        raise RuntimeError(f"ComfyUI produced only flat candidates for {panel.panel_id}")
-                    selected = await self._select_candidate(panel, usable)
-                    relative, path = usable[selected]
+                    selected = await self._select_candidate(panel, candidates)
+                    relative, path = candidates[selected]
                     return PanelRender(
                         panel_id=panel.panel_id,
                         status="completed",
@@ -427,20 +461,24 @@ class RenderingService:
         panel: PanelGenerationPrompt,
         candidates: list[tuple[Path, Path]],
     ) -> int:
+        """Select story fidelity with the local VLM and use visual ranking as fallback."""
         if len(candidates) == 1:
             return 0
-        fallback = max(range(len(candidates)), key=lambda i: _technical_candidate_score(candidates[i][1]))
+        fallback = max(
+            range(len(candidates)),
+            key=lambda index: _technical_candidate_score(candidates[index][1]),
+        )
         if not self.settings.comfyui_candidate_selection or self.settings.vision_provider != "ollama":
             return fallback
         try:
-            encoded_images: list[str] = []
+            images: list[str] = []
             for _, path in candidates:
                 with Image.open(path) as source:
                     preview = source.convert("RGB")
                     preview.thumbnail((512, 512))
                     buffer = io.BytesIO()
                     preview.save(buffer, format="JPEG", quality=84)
-                    encoded_images.append(base64.b64encode(buffer.getvalue()).decode("ascii"))
+                    images.append(base64.b64encode(buffer.getvalue()).decode("ascii"))
             requirement = {
                 "scene": panel.positive_prompt,
                 "composition": panel.composition_control,
@@ -459,13 +497,13 @@ class RenderingService:
                     "messages": [{
                         "role": "user",
                         "content": (
-                            f"Compare candidate images 0 through {len(encoded_images) - 1}. Select the image that "
-                            "best contains every requested subject and action with correct camera framing. Reject "
-                            "missing characters and wrong objects before judging beauty. "
+                            f"These are candidate images 0 through {len(images) - 1}. Choose the one that most "
+                            "accurately shows the requested subject, action and camera composition; anatomy and "
+                            "drawing quality break ties. Never prefer abstract detail over a missing main character. "
                             f"Requirement: {json.dumps(requirement, ensure_ascii=False)}. "
                             'Return JSON only: {"candidate_index": integer, "reason": "brief"}.'
                         ),
-                        "images": encoded_images,
+                        "images": images,
                     }],
                 })
             response.raise_for_status()
@@ -515,7 +553,11 @@ class RenderingService:
             },
             "4": {
                 "class_type": "EmptyLatentImage",
-                "inputs": {"width": width, "height": height, "batch_size": self.settings.comfyui_candidates},
+                "inputs": {
+                    "width": width,
+                    "height": height,
+                    "batch_size": self.settings.comfyui_candidates,
+                },
             },
             "5": {
                 "class_type": "KSampler",
@@ -545,26 +587,48 @@ class RenderingService:
             },
         }
         if reference_image:
-            workflow.update({
-                "10": {
-                    "class_type": "LoadImage",
-                    "inputs": {"image": reference_image},
-                },
-                "11": {
+            workflow["10"] = {
+                "class_type": "LoadImage",
+                "inputs": {"image": reference_image},
+            }
+            if self.settings.comfyui_faceid_enabled:
+                workflow["11"] = {
+                    "class_type": "IPAdapterUnifiedLoaderFaceID",
+                    "inputs": {
+                        "model": ["1", 0],
+                        "preset": "FACEID PLUS V2",
+                        "lora_strength": self.settings.comfyui_faceid_lora_strength,
+                        "provider": self.settings.comfyui_faceid_provider,
+                    },
+                }
+                workflow["12"] = {
+                    "class_type": "IPAdapterFaceID",
+                    "inputs": {
+                        "model": ["11", 0], "ipadapter": ["11", 1], "image": ["10", 0],
+                        "weight": reference_strength or self.settings.comfyui_ipadapter_weight,
+                        "weight_faceidv2": self.settings.comfyui_faceid_weight_v2,
+                        "weight_type": "linear", "combine_embeds": "average",
+                        "start_at": 0.0,
+                        "end_at": reference_end_at or self.settings.comfyui_ipadapter_end_at,
+                        "embeds_scaling": "K+V w/ C penalty",
+                    },
+                }
+            else:
+                workflow["11"] = {
                     "class_type": "IPAdapterUnifiedLoader",
-                    "inputs": {"model": ["1", 0], "preset": "PLUS (high strength)"},
-                },
-                "12": {
+                    "inputs": {"model": ["1", 0], "preset": "PLUS FACE (portraits)"},
+                }
+                workflow["12"] = {
                     "class_type": "IPAdapterAdvanced",
                     "inputs": {
                         "model": ["11", 0], "ipadapter": ["11", 1], "image": ["10", 0],
                         "weight": reference_strength or self.settings.comfyui_ipadapter_weight,
-                        "weight_type": "linear", "combine_embeds": "average",
-                        "start_at": 0.0, "end_at": reference_end_at or self.settings.comfyui_ipadapter_end_at,
+                        "weight_type": "ease out", "combine_embeds": "average",
+                        "start_at": 0.0,
+                        "end_at": reference_end_at or self.settings.comfyui_ipadapter_end_at,
                         "embeds_scaling": "K+V w/ C penalty",
                     },
-                },
-            })
+                }
             workflow["5"]["inputs"]["model"] = ["12", 0]
         return workflow
 
