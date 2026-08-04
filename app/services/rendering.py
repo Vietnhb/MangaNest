@@ -1,5 +1,8 @@
 import asyncio
+import base64
 import hashlib
+import io
+import json
 import logging
 import re
 import textwrap
@@ -7,7 +10,7 @@ from pathlib import Path
 from typing import Literal
 
 import httpx
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 
 from app.core.config import Settings
 from app.schemas.generation import GenerationOutput, PanelGenerationPrompt
@@ -21,10 +24,52 @@ _CHROMATIC_COLOR = re.compile(
     flags=re.IGNORECASE,
 )
 
+_SUBJECT_TAG = re.compile(r"^(?:\d+girls?|\d+boys?|\d+others?|solo|multiple (?:girls|boys|people))$", re.IGNORECASE)
+
 
 def _monochrome_description(value: str) -> str:
     """Preserve canonical color identity as a readable grayscale tone."""
     return _CHROMATIC_COLOR.sub("distinctive dark-toned", value)
+
+
+def _prompt_tags(*sections: str, limit: int) -> list[str]:
+    tags: list[str] = []
+    seen: set[str] = set()
+    for section in sections:
+        for raw in re.split(r"[,;\n]+", section):
+            tag = re.sub(r"\s+", " ", raw).strip(" .")
+            key = tag.casefold()
+            if not tag or key in seen:
+                continue
+            seen.add(key)
+            tags.append(tag)
+            if len(tags) >= limit:
+                return tags
+    return tags
+
+
+def _compile_animagine_positive(panel: PanelGenerationPrompt, generation: GenerationOutput) -> str:
+    raw_tags = _prompt_tags(_monochrome_description(panel.positive_prompt), limit=48)
+    subjects = [tag for tag in raw_tags if _SUBJECT_TAG.fullmatch(tag)]
+    details = [tag for tag in raw_tags if tag not in subjects]
+    identity = ", ".join(_monochrome_description(item) for item in panel.character_consistency)
+    return ", ".join(_prompt_tags(
+        ", ".join(subjects), identity, ", ".join(details), panel.composition_control,
+        _monochrome_description(generation.global_style_prefix),
+        "single uninterrupted illustration, one scene, no frames, no borders, monochrome, grayscale, "
+        "black and white, crisp inked lineart, screentone, high contrast",
+        "safe, masterpiece, high score, great score, absurdres", limit=64,
+    ))
+
+
+def _compile_animagine_negative(panel: PanelGenerationPrompt, generation: GenerationOutput) -> str:
+    return ", ".join(_prompt_tags(
+        "lowres, bad anatomy, bad hands, text, error, missing finger, extra digits, fewer digits, cropped, "
+        "worst quality, low quality, low score, bad score, average score, signature, watermark, username, blurry",
+        "color, colorful, multiple panels, manga page, comic page, comic strip, panel grid, collage, split screen, "
+        "contact sheet, frame, panel border, speech bubble, lettering",
+        generation.global_negative_prefix, panel.negative_prompt, limit=64,
+    ))
 
 
 def _bounded_dimensions(
@@ -35,15 +80,42 @@ def _bounded_dimensions(
 ) -> tuple[int, int]:
     aspect_ratio = width / height
     if aspect_ratio >= 1.25:
-        width, height = 768, 512
+        width, height = 1216, 832
     elif aspect_ratio <= 0.8:
-        width, height = 576, 896
+        width, height = 832, 1216
     else:
-        width, height = 640, 640
+        width, height = 1024, 1024
     scale = min(max_width / width, max_height / height, 1.0)
     bounded_width = max(256, int(width * scale) // 64 * 64)
     bounded_height = max(256, int(height * scale) // 64 * 64)
     return bounded_width, bounded_height
+
+
+def _normalize_manga_art(path: Path) -> None:
+    with Image.open(path) as source:
+        normalized = ImageOps.grayscale(source).filter(
+            ImageFilter.UnsharpMask(radius=0.45, percent=25, threshold=4)
+        )
+        normalized.save(path, format="PNG", optimize=True)
+
+
+def _technical_candidate_score(path: Path) -> float:
+    with Image.open(path) as source:
+        image = ImageOps.grayscale(source).resize((256, 256), Image.Resampling.BILINEAR)
+        histogram = image.histogram()
+        pixels = image.width * image.height
+        clipped = (sum(histogram[:4]) + sum(histogram[-4:])) / pixels
+        entropy = image.entropy()
+        edges = image.filter(ImageFilter.FIND_EDGES)
+        edge_energy = sum(i * count for i, count in enumerate(edges.histogram())) / (pixels * 255)
+    return entropy + edge_energy * 2.0 - clipped * 3.0
+
+
+def _candidate_is_flat(path: Path) -> bool:
+    with Image.open(path) as source:
+        gray = ImageOps.grayscale(source).resize((256, 256), Image.Resampling.BILINEAR)
+        extrema = gray.getextrema()
+        return gray.entropy() < 3.0 or (extrema[1] - extrema[0]) < 24
 
 
 class RenderingService:
@@ -191,7 +263,7 @@ class RenderingService:
         return RenderOutput(
             backend="comfyui",
             checkpoint=self.settings.comfyui_checkpoint,
-            workflow_version="sdxl-ipadapter-identity-v5" if self.settings.comfyui_ipadapter_enabled else "sdxl-identity-seed-v2",
+            workflow_version="sdxl-ipadapter-native-candidates-v7" if self.settings.comfyui_ipadapter_enabled else "sdxl-native-candidates-v3",
             panels=rendered,
             identity_references=references,
         )
@@ -279,6 +351,7 @@ class RenderingService:
         reference_image: str | None = None,
         reference_strength: float | None = None,
         reference_end_at: float | None = None,
+        quality_retry: int = 0,
     ) -> PanelRender:
         width, height = _bounded_dimensions(
             panel.parameters.width,
@@ -292,7 +365,7 @@ class RenderingService:
             else panel.panel_id
         )
         seed_material = (
-            f"{self.settings.comfyui_checkpoint}|{identity_key}|{panel.panel_id}|variation:{revision_count}".encode("utf-8")
+            f"{self.settings.comfyui_checkpoint}|{identity_key}|{panel.panel_id}|variation:{revision_count}|quality-retry:{quality_retry}".encode("utf-8")
         )
         seed = (
             int.from_bytes(hashlib.sha256(seed_material).digest()[:4], "big")
@@ -315,9 +388,23 @@ class RenderingService:
                 output = history[prompt_id].get("outputs", {}).get("9", {})
                 images = output.get("images", [])
                 if images:
-                    item = images[0]
-                    relative = Path(item.get("subfolder", "")) / item["filename"]
-                    path = self.output_dir / relative
+                    candidates: list[tuple[Path, Path]] = []
+                    for item in images:
+                        relative_path = Path(item.get("subfolder", "")) / item["filename"]
+                        candidate_path = self.output_dir / relative_path
+                        await asyncio.to_thread(_normalize_manga_art, candidate_path)
+                        candidates.append((relative_path, candidate_path))
+                    usable = [item for item in candidates if not _candidate_is_flat(item[1])]
+                    if not usable:
+                        if quality_retry < 1:
+                            logger.warning("All candidates for %s were flat; retrying with new noise", panel.panel_id)
+                            return await self._render_comfyui_panel(
+                                client, panel, generation, revision_count, reference_image,
+                                reference_strength, reference_end_at, quality_retry + 1,
+                            )
+                        raise RuntimeError(f"ComfyUI produced only flat candidates for {panel.panel_id}")
+                    selected = await self._select_candidate(panel, usable)
+                    relative, path = usable[selected]
                     return PanelRender(
                         panel_id=panel.panel_id,
                         status="completed",
@@ -335,6 +422,69 @@ class RenderingService:
             await asyncio.sleep(1)
         raise TimeoutError(f"ComfyUI timed out for panel {panel.panel_id}")
 
+    async def _select_candidate(
+        self,
+        panel: PanelGenerationPrompt,
+        candidates: list[tuple[Path, Path]],
+    ) -> int:
+        if len(candidates) == 1:
+            return 0
+        fallback = max(range(len(candidates)), key=lambda i: _technical_candidate_score(candidates[i][1]))
+        if not self.settings.comfyui_candidate_selection or self.settings.vision_provider != "ollama":
+            return fallback
+        try:
+            encoded_images: list[str] = []
+            for _, path in candidates:
+                with Image.open(path) as source:
+                    preview = source.convert("RGB")
+                    preview.thumbnail((512, 512))
+                    buffer = io.BytesIO()
+                    preview.save(buffer, format="JPEG", quality=84)
+                    encoded_images.append(base64.b64encode(buffer.getvalue()).decode("ascii"))
+            requirement = {
+                "scene": panel.positive_prompt,
+                "composition": panel.composition_control,
+                "identity": panel.character_consistency,
+            }
+            async with httpx.AsyncClient(
+                base_url=self.settings.ollama_base_url,
+                timeout=self.settings.ollama_timeout_seconds,
+            ) as vision_client:
+                response = await vision_client.post("/api/chat", json={
+                    "model": self.settings.ollama_vision_model,
+                    "stream": False,
+                    "format": "json",
+                    "think": False,
+                    "options": {"temperature": 0, "num_predict": 512},
+                    "messages": [{
+                        "role": "user",
+                        "content": (
+                            f"Compare candidate images 0 through {len(encoded_images) - 1}. Select the image that "
+                            "best contains every requested subject and action with correct camera framing. Reject "
+                            "missing characters and wrong objects before judging beauty. "
+                            f"Requirement: {json.dumps(requirement, ensure_ascii=False)}. "
+                            'Return JSON only: {"candidate_index": integer, "reason": "brief"}.'
+                        ),
+                        "images": encoded_images,
+                    }],
+                })
+            response.raise_for_status()
+            message = response.json()["message"]
+            raw = (message.get("content") or message.get("thinking") or "").strip()
+            raw = raw.removeprefix("```json").removesuffix("```").strip()
+            try:
+                decoded = json.loads(raw)
+            except json.JSONDecodeError:
+                match = re.search(r"\{.*?\}", raw, flags=re.DOTALL)
+                if match is None:
+                    raise
+                decoded = json.loads(match.group(0))
+            selected = int(decoded["candidate_index"])
+            return selected if 0 <= selected < len(candidates) else fallback
+        except Exception:
+            logger.warning("Candidate semantic selection failed; using technical ranking", exc_info=True)
+            return fallback
+
     def _workflow(
         self,
         panel: PanelGenerationPrompt,
@@ -347,35 +497,8 @@ class RenderingService:
         reference_strength: float | None = None,
         reference_end_at: float | None = None,
     ) -> dict:
-        positive = ", ".join(
-            filter(
-                None,
-                [
-                    "single uninterrupted full-bleed illustration, one scene, no frames, "
-                    "no borders, (monochrome:1.4), (grayscale:1.3), (black and white:1.3), "
-                    "crisp inked lineart, screentone, high contrast",
-                    _monochrome_description(generation.global_style_prefix),
-                    _monochrome_description(panel.positive_prompt),
-                    panel.composition_control,
-                    "safe, masterpiece, high score, great score, absurdres",
-                ],
-            )
-        )
-        negative = ", ".join(
-            filter(
-                None,
-                [
-                    "(color:1.5), colorful, red, blue, green, (multiple panels:1.7), "
-                    "(manga page:1.6), (comic page:1.6), (comic strip:1.6), (panel grid:1.6), "
-                    "(collage:1.6), (split screen:1.6), contact sheet, frame, panel border, "
-                    "text, speech bubble, lettering",
-                    generation.global_negative_prefix,
-                    panel.negative_prompt,
-                    "lowres, bad anatomy, bad hands, missing fingers, extra digits, cropped, "
-                    "worst quality, low quality, signature, watermark, username, blurry",
-                ],
-            )
-        )
+        positive = _compile_animagine_positive(panel, generation)
+        negative = _compile_animagine_negative(panel, generation)
         sampler_model: list[int | str] = ["1", 0]
         workflow: dict[str, dict] = {
             "1": {
@@ -392,7 +515,7 @@ class RenderingService:
             },
             "4": {
                 "class_type": "EmptyLatentImage",
-                "inputs": {"width": width, "height": height, "batch_size": 1},
+                "inputs": {"width": width, "height": height, "batch_size": self.settings.comfyui_candidates},
             },
             "5": {
                 "class_type": "KSampler",

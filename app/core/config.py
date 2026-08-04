@@ -53,12 +53,14 @@ class Settings(BaseSettings):
     comfyui_cfg_scale: float = Field(default=5.0, ge=1, le=15)
     comfyui_sampler: str = "euler_ancestral"
     comfyui_scheduler: str = "normal"
+    comfyui_candidates: int = Field(default=2, ge=1, le=4)
+    comfyui_candidate_selection: bool = True
     comfyui_ipadapter_enabled: bool = True
     comfyui_ipadapter_weight: float = Field(default=0.42, ge=0, le=1.5)
     comfyui_ipadapter_end_at: float = Field(default=0.65, ge=0.1, le=1)
     render_output_dir: str = "E:/MangaForgeAI/outputs"
-    render_max_width: int = Field(default=768, ge=256, le=4096)
-    render_max_height: int = Field(default=1024, ge=256, le=4096)
+    render_max_width: int = Field(default=1216, ge=256, le=4096)
+    render_max_height: int = Field(default=1216, ge=256, le=4096)
 
     @property
     def cors_origin_list(self) -> list[str]:
